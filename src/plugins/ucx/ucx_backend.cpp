@@ -30,10 +30,24 @@
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include <asio.hpp>
+#include <chrono>
+#include "common/configuration.h"
 
 /****************************************
  * Backend request management
 *****************************************/
+
+// Opt-in profiling of the RMA submission (ucp_get_nbx / ucp_put_nbx loop) and
+// completion (post -> done) per transfer request, to expose how the per-op
+// submission cost and the completion latency scale with descriptor count /
+// block size. Enable with NIXL_UCX_XFER_PROFILE=y (read once). Emits one
+// [ucx.prof] NIXL_INFO line per completed transfer request. Off => zero cost.
+[[nodiscard]] static bool
+nixlUcxXferProfileEnabled() {
+    static const bool enabled =
+        nixl::config::getValueDefaulted<bool>("NIXL_UCX_XFER_PROFILE", false);
+    return enabled;
+}
 
 class nixlUcxBackendReqH : public nixlBackendReqH {
 private:
@@ -74,6 +88,50 @@ public:
     };
 
     std::optional<Notif> notif;
+
+    // ---- Submission/completion profiling (NIXL_UCX_XFER_PROFILE) ----------
+    // Set in postXfer after the ucp_get/put submission loop; logged once when
+    // the request first reaches NIXL_SUCCESS (in checkXfer / inline in
+    // postXfer). All zero/no-op unless profiling is enabled.
+    bool profiled_ = false;
+    bool completionLogged_ = false;
+    size_t opCount_ = 0;       // ucp_get/put ops issued == post-merge descCount
+    size_t totalBytes_ = 0;    // total bytes across those ops
+    std::chrono::steady_clock::time_point postStart_{};
+    std::chrono::steady_clock::duration submitDuration_{};
+
+    void
+    profileSetSubmit(size_t ops, size_t bytes,
+                     std::chrono::steady_clock::time_point start,
+                     std::chrono::steady_clock::duration submit) {
+        profiled_ = true;
+        opCount_ = ops;
+        totalBytes_ = bytes;
+        postStart_ = start;
+        submitDuration_ = submit;
+    }
+
+    void
+    profileLogCompletion() {
+        if (!profiled_ || completionLogged_)
+            return;
+        completionLogged_ = true;
+        const auto now = std::chrono::steady_clock::now();
+        const double submit_us =
+            std::chrono::duration<double, std::micro>(submitDuration_).count();
+        const double complete_us =
+            std::chrono::duration<double, std::micro>(now - postStart_).count();
+        const double submit_ns_per_op =
+            opCount_ ? std::chrono::duration<double, std::nano>(submitDuration_)
+                           .count() / static_cast<double>(opCount_)
+                     : 0.0;
+        const size_t avg_op_bytes = opCount_ ? totalBytes_ / opCount_ : 0;
+        NIXL_INFO << "[ucx.prof] ops=" << opCount_ << " bytes=" << totalBytes_
+                  << " avg_op_bytes=" << avg_op_bytes
+                  << " submit_us=" << submit_us
+                  << " complete_us=" << complete_us
+                  << " submit_ns_per_op=" << submit_ns_per_op;
+    }
 
     nixlUcxBackendReqH(nixlUcxWorker *worker, size_t worker_id)
         : worker_(worker),
@@ -1271,9 +1329,27 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
 
     // TODO: assert that handle is empty/completed, as we can't post request before completion
 
+    const bool profile = nixlUcxXferProfileEnabled();
+    std::chrono::steady_clock::time_point submit_start;
+    if (profile) {
+        submit_start = std::chrono::steady_clock::now();
+    }
+
     ret = sendXferRange(operation, local, remote, remote_agent, handle, 0, lcnt);
     if (ret != NIXL_SUCCESS) {
         return ret;
+    }
+
+    if (profile) {
+        const auto submit_dur = std::chrono::steady_clock::now() - submit_start;
+        // lcnt is the post-merge descriptor count (makeXferReq already
+        // coalesced contiguous descs), i.e. the actual number of ucp_get/put
+        // ops sendXferRange issued.
+        size_t total_bytes = 0;
+        for (size_t i = 0; i < lcnt; ++i) {
+            total_bytes += local[i].len;
+        }
+        int_handle->profileSetSubmit(lcnt, total_bytes, submit_start, submit_dur);
     }
 
     ret = int_handle->status();
@@ -1295,6 +1371,12 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
         }
     }
 
+    // Inline-completion case: the whole transfer finished within postXfer
+    // (no async progress needed), so checkXfer may never be called for it.
+    if (profile && ret == NIXL_SUCCESS) {
+        int_handle->profileLogCompletion();
+    }
+
     return ret;
 }
 
@@ -1304,6 +1386,10 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
     const nixl_status_t handle_status = int_handle->status();
 
     if ((handle_status == NIXL_IN_PROG) || !int_handle->notif) {
+        // Terminal (no pending notif): log post->done once on success.
+        if (handle_status == NIXL_SUCCESS) {
+            int_handle->profileLogCompletion();
+        }
         return handle_status;
     }
 
@@ -1327,7 +1413,11 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
         return status;
     }
 
-    return int_handle->status();
+    const nixl_status_t final_status = int_handle->status();
+    if (final_status == NIXL_SUCCESS) {
+        int_handle->profileLogCompletion();
+    }
+    return final_status;
 }
 
 nixl_status_t nixlUcxEngine::releaseReqH(nixlBackendReqH* handle) const
