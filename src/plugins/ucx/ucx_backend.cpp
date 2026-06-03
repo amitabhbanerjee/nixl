@@ -31,6 +31,9 @@
 #include "absl/strings/str_split.h"
 #include <asio.hpp>
 #include <chrono>
+#include <array>
+#include <cmath>
+#include <limits>
 #include "common/configuration.h"
 
 /****************************************
@@ -48,6 +51,64 @@ nixlUcxXferProfileEnabled() {
         nixl::config::getValueDefaulted<bool>("NIXL_UCX_XFER_PROFILE", false);
     return enabled;
 }
+
+// Per-descriptor (per ucp_get_nbx / ucp_put_nbx) submission-time distribution
+// for one transfer request. We can time the *submission* of each op precisely;
+// per-op wire-completion is not separable here because the backend keeps only
+// the last request handle per EP-batch and polls it. A heavy tail / large
+// stddev as the descriptor count grows points at TX-queue backpressure during
+// submission. All zero-cost unless profiling is on.
+struct nixlUcxDescTimeStats {
+    uint64_t count = 0;
+    double sum_us = 0.0;
+    double sum_sq_us = 0.0;
+    double min_us = std::numeric_limits<double>::max();
+    double max_us = 0.0;
+    // Bucket edges in us: <0.2, .2-.5, .5-1, 1-2, 2-5, 5-10, 10-50, 50-100, >=100
+    static constexpr size_t kNumBuckets = 9;
+    std::array<uint64_t, kNumBuckets> buckets{};
+
+    void
+    reset() {
+        *this = nixlUcxDescTimeStats();
+    }
+
+    static size_t
+    bucketIndex(double us) {
+        static constexpr double edges[kNumBuckets - 1] = {0.2, 0.5, 1.0, 2.0,
+                                                          5.0, 10.0, 50.0, 100.0};
+        for (size_t i = 0; i < kNumBuckets - 1; ++i)
+            if (us < edges[i])
+                return i;
+        return kNumBuckets - 1;
+    }
+
+    void
+    add(double us) {
+        ++count;
+        sum_us += us;
+        sum_sq_us += us * us;
+        if (us < min_us)
+            min_us = us;
+        if (us > max_us)
+            max_us = us;
+        ++buckets[bucketIndex(us)];
+    }
+
+    [[nodiscard]] double
+    mean() const {
+        return count ? sum_us / static_cast<double>(count) : 0.0;
+    }
+
+    [[nodiscard]] double
+    stddev() const {
+        if (count < 2)
+            return 0.0;
+        const double m = mean();
+        const double var = (sum_sq_us / static_cast<double>(count)) - m * m;
+        return var > 0.0 ? std::sqrt(var) : 0.0;
+    }
+};
 
 class nixlUcxBackendReqH : public nixlBackendReqH {
 private:
@@ -99,6 +160,7 @@ public:
     size_t totalBytes_ = 0;    // total bytes across those ops
     std::chrono::steady_clock::time_point postStart_{};
     std::chrono::steady_clock::duration submitDuration_{};
+    nixlUcxDescTimeStats descSubmitStats_;  // per-op submission time distribution
 
     void
     profileSetSubmit(size_t ops, size_t bytes,
@@ -131,6 +193,17 @@ public:
                   << " submit_us=" << submit_us
                   << " complete_us=" << complete_us
                   << " submit_ns_per_op=" << submit_ns_per_op;
+        const auto &d = descSubmitStats_;
+        if (d.count) {
+            NIXL_INFO << "[ucx.desc] submit_per_op_us n=" << d.count
+                      << " min=" << d.min_us << " max=" << d.max_us
+                      << " mean=" << d.mean() << " stddev=" << d.stddev()
+                      << " hist[<.2/.2-.5/.5-1/1-2/2-5/5-10/10-50/50-100/>=100]="
+                      << d.buckets[0] << "/" << d.buckets[1] << "/" << d.buckets[2]
+                      << "/" << d.buckets[3] << "/" << d.buckets[4] << "/"
+                      << d.buckets[5] << "/" << d.buckets[6] << "/" << d.buckets[7]
+                      << "/" << d.buckets[8];
+        }
     }
 
     nixlUcxBackendReqH(nixlUcxWorker *worker, size_t worker_id)
@@ -1214,7 +1287,8 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                                   const nixl_meta_dlist_t &remote,
                                   size_t worker_id,
                                   size_t start_idx,
-                                  size_t end_idx) {
+                                  size_t end_idx,
+                                  nixlUcxDescTimeStats *submitStats /* = nullptr */) {
     batchResult result = {NIXL_SUCCESS, 0, nullptr};
 
     for (size_t i = start_idx; i < end_idx; ++i) {
@@ -1232,9 +1306,17 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
 
         ++result.size;
         nixlUcxReq req;
+        std::chrono::steady_clock::time_point op_t0;
+        if (__builtin_expect(submitStats != nullptr, 0)) {
+            op_t0 = std::chrono::steady_clock::now();
+        }
         const nixl_status_t ret = operation == NIXL_READ ?
             ep.read(raddr, rmd->getRkey(worker_id), laddr, lmd->mem, lsize, req) :
             ep.write(laddr, lmd->mem, raddr, rmd->getRkey(worker_id), lsize, req);
+        if (__builtin_expect(submitStats != nullptr, 0)) {
+            submitStats->add(std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - op_t0).count());
+        }
 
         if (ret == NIXL_IN_PROG) {
             if (__builtin_expect(result.req != nullptr, 1)) {
@@ -1276,12 +1358,21 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
      * one flush request, and one notification request */
     int_handle->reserve(3);
 
+    // Per-op submission timing (opt-in). Reset here so the distribution covers
+    // exactly this postXfer's submission loop.
+    nixlUcxDescTimeStats *submitStats = nullptr;
+    if (nixlUcxXferProfileEnabled()) {
+        int_handle->descSubmitStats_.reset();
+        submitStats = &int_handle->descSubmitStats_;
+    }
+
     for (size_t i = start_idx; i < end_idx;) {
         /* Send requests to a single EP */
         const auto rmd = static_cast<nixlUcxPublicMetadata *>(remote[i].metadataP);
         auto &ep = rmd->conn->getEp(worker_id);
         const batchResult result =
-            sendXferRangeBatch(*ep, operation, local, remote, worker_id, i, end_idx);
+            sendXferRangeBatch(*ep, operation, local, remote, worker_id, i, end_idx,
+                               submitStats);
 
         /* Append a single pending request for the entire EP batch */
         const nixl_status_t ret = int_handle->append(result.status, result.req, rmd->conn);

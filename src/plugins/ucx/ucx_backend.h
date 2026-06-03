@@ -39,6 +39,11 @@
 #include "ucx_enums.h"
 #include "ucx_utils.h"
 
+// Defined in ucx_backend.cpp; used by reference only here. Holds the per-op
+// (ucp_get_nbx/put_nbx) submission-time distribution for one transfer when
+// NIXL_UCX_XFER_PROFILE is set.
+struct nixlUcxDescTimeStats;
+
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
         std::vector<std::unique_ptr<nixlUcxEp>> eps;
@@ -278,7 +283,8 @@ private:
                        const nixl_meta_dlist_t &remote,
                        size_t worker_id,
                        size_t start_idx,
-                       size_t end_idx);
+                       size_t end_idx,
+                       nixlUcxDescTimeStats *submitStats = nullptr);
 
     /**
      * Get the worker ID from the optional arguments.
