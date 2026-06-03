@@ -39,6 +39,17 @@ const std::vector<std::vector<std::string>> illegal_plugin_combinations = {
     {"GDS", "GDS_MT"},
 };
 
+// Opt-in: time the backend engine->postXfer() call from postXferReq (the
+// single call that internally issues the whole descriptor batch). Shares the
+// NIXL_UCX_XFER_PROFILE switch with the UCX-backend profiling so one env var
+// turns on all transfer profiling. Read once; off => zero cost.
+[[nodiscard]] bool
+xferProfileEnabled() {
+    static const bool enabled =
+        nixl::config::getValueDefaulted<bool>("NIXL_UCX_XFER_PROFILE", false);
+    return enabled;
+}
+
 } // namespace
 
 void
@@ -1086,12 +1097,27 @@ nixlAgent::postXferReq(nixlXferReqH *req_hndl,
     }
 
     // If status is not NIXL_IN_PROG we can repost,
+    const bool profile_post = xferProfileEnabled();
+    std::chrono::steady_clock::time_point post_call_start;
+    if (profile_post) {
+        post_call_start = std::chrono::steady_clock::now();
+    }
     req_hndl->status = req_hndl->engine->postXfer(req_hndl->backendOp,
                                                   req_hndl->initiatorDescs,
                                                   req_hndl->targetDescs,
                                                   req_hndl->remoteAgent,
                                                   req_hndl->backendHandle,
                                                   &opt_args);
+    if (profile_post) {
+        const double post_call_us =
+            std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - post_call_start).count();
+        // descs is the post-merge descriptor count handed to the backend, i.e.
+        // the number of RMA ops the single postXfer() call issued in its loop.
+        NIXL_INFO << "[xfer.post_call] postXfer_us=" << post_call_us
+                  << " descs=" << req_hndl->initiatorDescs.descCount()
+                  << " status=" << req_hndl->status;
+    }
 
     if (req_hndl->status < 0) {
         if (req_hndl->status == NIXL_ERR_REMOTE_DISCONNECT) {
