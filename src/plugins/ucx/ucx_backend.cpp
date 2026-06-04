@@ -34,6 +34,9 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include "common/configuration.h"
 
 /****************************************
@@ -50,6 +53,38 @@ nixlUcxXferProfileEnabled() {
     static const bool enabled =
         nixl::config::getValueDefaulted<bool>("NIXL_UCX_XFER_PROFILE", false);
     return enabled;
+}
+
+// One-shot dump (per process) of the UCX endpoint configuration actually
+// selected for data transfer: the lanes/rails and their transports
+// (rc_mlx5/dc_mlx5/...), rndv settings, etc. The number of RMA lanes is the
+// active rail count, and the transport tells you whether you're on RC (where
+// concurrent RDMA-READs are bounded by the QP's max_rd_atomic, typically ~16)
+// or DC. Called from the first transfer so the endpoint is fully wired up and
+// the lanes are resolved. Gated by the profiling flag at the call site.
+static void
+nixlUcxLogEpInfoOnce(ucp_ep_h ep) {
+    static std::once_flag flag;
+    std::call_once(flag, [ep]() {
+        char *buf = nullptr;
+        size_t size = 0;
+        FILE *stream = open_memstream(&buf, &size);
+        if (stream == nullptr) {
+            NIXL_WARN << "[ucx.epinfo] open_memstream failed; "
+                         "cannot capture ucp_ep_print_info";
+            return;
+        }
+        ucp_ep_print_info(ep, stream);
+        fclose(stream);  // flushes; buf now holds the captured text
+        if (buf != nullptr) {
+            NIXL_INFO << "[ucx.epinfo] UCX endpoint transport/lane (rail) "
+                         "config for KV-transfer ops -- count the RMA lanes "
+                         "for rails, and the transport (rc=RDMA-READ bounded "
+                         "by max_rd_atomic) below:\n"
+                      << buf;
+            free(buf);
+        }
+    });
 }
 
 // Per-descriptor (per ucp_get_nbx / ucp_put_nbx) submission-time distribution
@@ -1370,6 +1405,12 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
         /* Send requests to a single EP */
         const auto rmd = static_cast<nixlUcxPublicMetadata *>(remote[i].metadataP);
         auto &ep = rmd->conn->getEp(worker_id);
+        // One-shot: dump the wired-up endpoint's lane/rail/transport config so
+        // the outstanding-read window (rails x max_rd_atomic) is visible next
+        // to the [ucx.desc] distribution. submitStats != nullptr == profiling on.
+        if (__builtin_expect(submitStats != nullptr, 0)) {
+            nixlUcxLogEpInfoOnce(ep->getEp());
+        }
         const batchResult result =
             sendXferRangeBatch(*ep, operation, local, remote, worker_id, i, end_idx,
                                submitStats);
