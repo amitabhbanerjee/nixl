@@ -196,6 +196,13 @@ public:
     std::chrono::steady_clock::time_point postStart_{};
     std::chrono::steady_clock::duration submitDuration_{};
     nixlUcxDescTimeStats descSubmitStats_;  // per-op submission time distribution
+    // Identity of the connection/QP this transfer used, so [ucx.prof] lines
+    // can be grouped per-QP across many transfers (is one QP consistently
+    // slow?). remoteAgent_ = which remote rank; epPtr_ = the ucp_ep handle
+    // (one endpoint per remote connection; QP-proximal -- 1:1 with a QP when
+    // MAX_RMA_RAILS=1).
+    std::string remoteAgent_;
+    uintptr_t epPtr_ = 0;
 
     void
     profileSetSubmit(size_t ops, size_t bytes,
@@ -223,11 +230,20 @@ public:
                            .count() / static_cast<double>(opCount_)
                      : 0.0;
         const size_t avg_op_bytes = opCount_ ? totalBytes_ / opCount_ : 0;
+        char ephex[32];
+        std::snprintf(ephex, sizeof(ephex), "0x%llx",
+                      static_cast<unsigned long long>(epPtr_));
         NIXL_INFO << "[ucx.prof] ops=" << opCount_ << " bytes=" << totalBytes_
                   << " avg_op_bytes=" << avg_op_bytes
                   << " submit_us=" << submit_us
                   << " complete_us=" << complete_us
-                  << " submit_ns_per_op=" << submit_ns_per_op;
+                  << " submit_ns_per_op=" << submit_ns_per_op
+                  // QP-attribution tags: group [ucx.prof] by ep (or remote)
+                  // across the run to see if one connection/QP is consistently
+                  // slow.
+                  << " remote=" << remoteAgent_
+                  << " worker=" << workerId_
+                  << " ep=" << ephex;
         const auto &d = descSubmitStats_;
         if (d.count) {
             NIXL_INFO << "[ucx.desc] submit_per_op_us n=" << d.count
@@ -1410,6 +1426,9 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
         // to the [ucx.desc] distribution. submitStats != nullptr == profiling on.
         if (__builtin_expect(submitStats != nullptr, 0)) {
             nixlUcxLogEpInfoOnce(ep->getEp());
+            // Record the endpoint this transfer used (QP-proximal id) for the
+            // per-QP attribution tag in [ucx.prof].
+            int_handle->epPtr_ = reinterpret_cast<uintptr_t>(ep->getEp());
         }
         const batchResult result =
             sendXferRangeBatch(*ep, operation, local, remote, worker_id, i, end_idx,
@@ -1482,6 +1501,7 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
             total_bytes += local[i].len;
         }
         int_handle->profileSetSubmit(lcnt, total_bytes, submit_start, submit_dur);
+        int_handle->remoteAgent_ = remote_agent;   // QP-attribution tag
     }
 
     ret = int_handle->status();
